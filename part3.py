@@ -11,6 +11,7 @@ import threading
 import subprocess
 import sqlite3
 from datetime import datetime, timedelta
+import tkinter as tk
 
 # Connection tracking database setup
 DB_FILE = os.path.join(os.path.expanduser("~"), ".attendance_tracker", "connections.db")
@@ -49,6 +50,17 @@ class ConnectionDatabase:
         )
         ''')
         
+        # Create table for current connection state
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS connection_state (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            is_connected INTEGER,
+            ssid TEXT,
+            connection_start_time REAL,
+            last_updated REAL
+        )
+        ''')
+        
         conn.commit()
         conn.close()
     
@@ -72,13 +84,56 @@ class ConnectionDatabase:
         
         return event_id
     
+    def save_connection_state(self, is_connected, ssid=None, connection_start_time=None):
+        """Save current connection state to survive app restarts"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Clear previous state
+        cursor.execute("DELETE FROM connection_state")
+        
+        # Insert new state
+        cursor.execute(
+            "INSERT INTO connection_state (is_connected, ssid, connection_start_time, last_updated) VALUES (?, ?, ?, ?)",
+            (1 if is_connected else 0, ssid or "", connection_start_time or time.time(), time.time())
+        )
+        
+        conn.commit()
+        conn.close()
+    
+    def get_connection_state(self):
+        """Get saved connection state"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT * FROM connection_state ORDER BY last_updated DESC LIMIT 1")
+        row = cursor.fetchone()
+        
+        conn.close()
+        
+        if row:
+            return {
+                "is_connected": bool(row["is_connected"]),
+                "ssid": row["ssid"],
+                "connection_start_time": row["connection_start_time"],
+                "last_updated": row["last_updated"]
+            }
+        else:
+            return {
+                "is_connected": False,
+                "ssid": None,
+                "connection_start_time": None,
+                "last_updated": None
+            }
+    
     def get_unsynced_events(self):
         """Get all unsynced events"""
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
-        cursor.execute("SELECT * FROM connection_events WHERE synced = 0")
+        cursor.execute("SELECT * FROM connection_events WHERE synced = 0 ORDER BY timestamp ASC")
         rows = cursor.fetchall()
         
         events = []
@@ -110,10 +165,25 @@ class WiFiMonitor:
         self.running = True
         self.offline_db = ConnectionDatabase()
         
+        # Load previous connection state to handle app restarts
+        self._load_connection_state()
+        
         # Start monitoring thread
         self.monitor_thread = threading.Thread(target=self.monitor_wifi, daemon=True)
         self.monitor_thread.start()
     
+    def _load_connection_state(self):
+        """Load saved connection state to handle restarts"""
+        state = self.offline_db.get_connection_state()
+        if state["is_connected"] and state["ssid"] == self.target_ssid:
+            self.app.log("Restoring previous connection state")
+            self.is_connected_to_target = True
+            self.last_ssid = state["ssid"]
+            self.connection_start_time = state["connection_start_time"]
+        else:
+            self.is_connected_to_target = False
+            self.connection_start_time = None
+            
     def get_current_ssid(self):
         """Get the current WiFi SSID (platform-specific)"""
         try:
@@ -198,6 +268,9 @@ class WiFiMonitor:
                     self.is_connected_to_target = True
                     self.connection_start_time = time.time()
                     
+                    # Save connection state to database
+                    self.offline_db.save_connection_state(True, self.target_ssid, self.connection_start_time)
+                    
                     # Prepare connection event data
                     connection_data = {
                         "ssid": self.target_ssid,
@@ -209,19 +282,28 @@ class WiFiMonitor:
                         "connection_start_time_formatted": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     }
                     
-                    # Send connect event to API
+                    # First save locally
+                    connection_data["event_type"] = "connect"
+                    connection_data["email"] = self.app.user_email or ""
+                    local_event_id = self.offline_db.add_event(connection_data)
+                    
+                    # Send connect event to API if possible
                     if hasattr(self.app, 'api_client'):
-                        self.app.api_client.track_connection("connect", connection_data)
-                    else:
-                        # Store offline if API client not available
-                        connection_data["event_type"] = "connect"
-                        connection_data["email"] = self.app.user_email or ""
-                        self.offline_db.add_event(connection_data)
+                        def callback(success, message, data=None):
+                            if success:
+                                # Mark as synced in local DB
+                                self.offline_db.mark_as_synced(local_event_id)
+                                self.app.log(f"Connection event synced, event ID: {local_event_id}")
+                        
+                        self.app.api_client.track_connection("connect", connection_data, callback)
                 
                 # If we were connected to target but now disconnected
                 elif self.last_ssid == self.target_ssid:
                     self.app.log(f"Disconnected from target WiFi network: {self.target_ssid}")
                     self.is_connected_to_target = False
+                    
+                    # Update connection state in database
+                    self.offline_db.save_connection_state(False)
                     
                     # Calculate connection duration
                     if self.connection_start_time:
@@ -244,16 +326,26 @@ class WiFiMonitor:
                             "connection_duration_formatted": formatted_duration
                         }
                         
-                        # Send disconnect event to API
+                        # First save locally
+                        disconnection_data["event_type"] = "disconnect"
+                        disconnection_data["email"] = self.app.user_email or ""
+                        local_event_id = self.offline_db.add_event(disconnection_data)
+                        
+                        # Send disconnect event to API if possible
                         if hasattr(self.app, 'api_client'):
-                            self.app.api_client.track_connection("disconnect", disconnection_data)
-                        else:
-                            # Store offline if API client not available
-                            disconnection_data["event_type"] = "disconnect" 
-                            disconnection_data["email"] = self.app.user_email or ""
-                            self.offline_db.add_event(disconnection_data)
+                            def callback(success, message, data=None):
+                                if success:
+                                    # Mark as synced in local DB
+                                    self.offline_db.mark_as_synced(local_event_id)
+                                    self.app.log(f"Disconnection event synced, event ID: {local_event_id}")
+                            
+                            self.app.api_client.track_connection("disconnect", disconnection_data, callback)
                     
                 self.last_ssid = self.current_ssid
+            
+            # Even if SSID didn't change, periodically update the saved state
+            if self.is_connected_to_target and self.connection_start_time:
+                self.offline_db.save_connection_state(True, self.target_ssid, self.connection_start_time)
             
             # Sync any offline events if we're online
             self.sync_offline_events()
@@ -266,10 +358,16 @@ class WiFiMonitor:
         if not hasattr(self.app, 'api_client') or not self.app.api_client.access_token:
             return
             
+        # Don't try to sync if we're in offline mode
+        if hasattr(self.app.api_client, 'offline_mode') and self.app.api_client.offline_mode:
+            return
+            
         # Get unsynced events
         events = self.offline_db.get_unsynced_events()
         if not events:
             return
+            
+        self.app.log(f"Attempting to sync {len(events)} offline events")
             
         for event in events:
             # Remove SQLite-specific fields
@@ -277,10 +375,10 @@ class WiFiMonitor:
             event.pop('synced', None)
             
             # Send to API
-            def callback(success, message, data=None):
+            def callback(success, message, data=None, _event_id=event_id):  # Use default arg to capture current event_id
                 if success:
-                    self.offline_db.mark_as_synced(event_id)
-                    self.app.log(f"Synced offline event {event_id}: {event['event_type']}")
+                    self.offline_db.mark_as_synced(_event_id)
+                    self.app.log(f"Synced offline event {_event_id}: {event['event_type']}")
             
             self.app.api_client.track_connection(event['event_type'], event, callback)
             
@@ -311,6 +409,58 @@ def extend_app_wifi_monitoring(app):
         original_exit_app(icon)
     
     app.exit_app = exit_app_extended
+    
+    # Override the update_wifi_status method to show more detail
+    original_update_wifi_status = app.update_wifi_status
+    
+    def update_wifi_status_extended(connected, ssid=None):
+        if not hasattr(app, 'wifi_status_var') or not hasattr(app, 'connection_status_var'):
+            return
+            
+        if connected and ssid:
+            app.wifi_status_var.set(f"Connected to: {ssid}")
+            
+            if ssid == app.config["target_ssid"]:
+                app.connection_status_var.set("✓ Connected to office network")
+                
+                # Add duration info if available
+                if hasattr(app, 'wifi_monitor') and app.wifi_monitor.connection_start_time:
+                    duration = time.time() - app.wifi_monitor.connection_start_time
+                    formatted_duration = app.wifi_monitor.format_duration(duration)
+                    
+                    # Create a duration variable if it doesn't exist
+                    if not hasattr(app, 'connection_duration_var'):
+                        if app.root and hasattr(app.root, 'winfo_exists') and app.root.winfo_exists():
+                            # Find status frame
+                            status_frame = None
+                            for widget in app.root.winfo_children():
+                                if hasattr(widget, 'winfo_children'):
+                                    for child in widget.winfo_children():
+                                        if hasattr(child, 'cget') and child.cget('text') == "Connection Status":
+                                            status_frame = child
+                                            break
+                            
+                            if status_frame:
+                                app.connection_duration_var = tk.StringVar(value="")
+                                duration_label = tk.Label(status_frame, textvariable=app.connection_duration_var)
+                                duration_label.pack(anchor="w")
+                    
+                    # Update duration if variable exists
+                    if hasattr(app, 'connection_duration_var'):
+                        app.connection_duration_var.set(f"Duration: {formatted_duration}")
+            else:
+                app.connection_status_var.set("✗ Not connected to office network")
+                # Clear duration if not connected to target
+                if hasattr(app, 'connection_duration_var'):
+                    app.connection_duration_var.set("")
+        else:
+            app.wifi_status_var.set("Not connected to WiFi")
+            app.connection_status_var.set("✗ Not connected to office network")
+            # Clear duration if not connected
+            if hasattr(app, 'connection_duration_var'):
+                app.connection_duration_var.set("")
+    
+    app.update_wifi_status = update_wifi_status_extended
     
     return app
 

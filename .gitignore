@@ -1,2 +1,10 @@
 agent
 __pycache__
+build
+dist
+*.egg-info
+*.egg
+*.whl
+*.tar.gz
+*.zip
+*.pdb

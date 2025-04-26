@@ -8,7 +8,7 @@ import requests
 import threading
 import keyring
 from urllib.parse import urljoin
-from datetime import datetime
+from datetime import datetime, timedelta
 import uuid
 import platform
 import subprocess
@@ -21,9 +21,16 @@ class ApiClient:
         self.user_data = None
         self.token_service_name = "AttendanceTracker"
         self.token_username = "access_token"
+        self.offline_mode = False
+        self.token_expiry = None
+        self.refresh_token = None
         
         # Try to load saved token
         self._load_token()
+        
+        # Start token refresh thread if token exists
+        if self.access_token and self.refresh_token:
+            self._start_token_refresh_thread()
     
     def _load_token(self):
         """Load saved token from secure storage"""
@@ -32,8 +39,16 @@ class ApiClient:
             if token:
                 saved_data = json.loads(token)
                 self.access_token = saved_data.get("token")
+                self.refresh_token = saved_data.get("refresh_token")
+                self.token_expiry = saved_data.get("expiry")
                 self.user_data = saved_data.get("user_data")
                 self.app.user_email = saved_data.get("email")
+                
+                # Check if token is expired
+                if self.token_expiry and time.time() > self.token_expiry:
+                    self.app.log("Saved token is expired, will try to refresh")
+                    # We'll still set is_logged_in to True and try to refresh in the background
+                
                 self.app.is_logged_in = True
                 self.app.log("Loaded saved authentication token")
                 return True
@@ -41,11 +56,19 @@ class ApiClient:
             self.app.log(f"Error loading saved token: {str(e)}", "error")
         return False
     
-    def _save_token(self, token, user_data, email):
+    def _save_token(self, token, refresh_token=None, expiry=None, user_data=None, email=None):
         """Save token to secure storage"""
         try:
+            # Use existing values if not provided
+            refresh_token = refresh_token or self.refresh_token
+            user_data = user_data or self.user_data
+            email = email or self.app.user_email
+            expiry = expiry or self.token_expiry
+            
             saved_data = {
                 "token": token,
+                "refresh_token": refresh_token,
+                "expiry": expiry,
                 "user_data": user_data,
                 "email": email
             }
@@ -61,6 +84,89 @@ class ApiClient:
             self.app.log("Cleared authentication token")
         except Exception as e:
             self.app.log(f"Error clearing token: {str(e)}", "error")
+    
+    def _refresh_token_task(self):
+        """Background task to refresh token before it expires"""
+        while self.running and self.access_token and self.refresh_token:
+            # Calculate time until token expires
+            if self.token_expiry:
+                now = time.time()
+                time_until_expiry = self.token_expiry - now
+                
+                # If token expires in less than 5 minutes, refresh it
+                if time_until_expiry < 300:
+                    self.app.log("Token is about to expire, refreshing...")
+                    self._refresh_token_now()
+                
+                # Sleep for a while (check every minute)
+                time.sleep(60)
+            else:
+                # If we don't know when token expires, check every 30 minutes
+                time.sleep(1800)
+    
+    def _start_token_refresh_thread(self):
+        """Start background thread for token refresh"""
+        self.running = True
+        self.refresh_thread = threading.Thread(target=self._refresh_token_task, daemon=True)
+        self.refresh_thread.start()
+    
+    def _stop_token_refresh_thread(self):
+        """Stop token refresh thread"""
+        self.running = False
+        if hasattr(self, 'refresh_thread') and self.refresh_thread.is_alive():
+            self.refresh_thread.join(timeout=1.0)
+    
+    def _refresh_token_now(self):
+        """Refresh the access token using refresh token"""
+        if not self.refresh_token:
+            self.app.log("No refresh token available", "warning")
+            return False
+            
+        url = urljoin(self.base_url, "/api/desktop/refresh-token")
+        payload = {"refresh_token": self.refresh_token}
+        
+        try:
+            response = requests.post(url, json=payload, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("success"):
+                    # Extract and store new tokens
+                    token_data = data.get("data", {})
+                    new_token = token_data.get("accessToken")
+                    new_refresh_token = token_data.get("refreshToken")
+                    expiry = time.time() + token_data.get("expiresIn", 3600)
+                    
+                    if new_token:
+                        self.access_token = new_token
+                        if new_refresh_token:
+                            self.refresh_token = new_refresh_token
+                        self.token_expiry = expiry
+                        
+                        # Save updated tokens
+                        self._save_token(new_token, new_refresh_token, expiry)
+                        
+                        self.app.log("Token refreshed successfully")
+                        return True
+            
+            self.app.log(f"Failed to refresh token: {response.status_code}", "warning")
+            return False
+            
+        except requests.RequestException as e:
+            self.app.log(f"Token refresh error: {str(e)}", "error")
+            # Enter offline mode if we can't reach the server
+            self.offline_mode = True
+            return False
+    
+    def check_online_status(self):
+        """Check if we can connect to the API server"""
+        try:
+            response = requests.get(self.base_url, timeout=5)
+            self.offline_mode = False
+            return True
+        except requests.RequestException:
+            self.offline_mode = True
+            return False
     
     def get_mac_address(self):
         """Get device MAC address"""
@@ -126,6 +232,12 @@ class ApiClient:
         }
         
         def _do_login():
+            # First check if we're online
+            if not self.check_online_status():
+                if callback:
+                    callback(False, "Cannot connect to server. Check your internet connection.")
+                return
+                
             try:
                 self.app.log(f"Sending login request with payload: {json.dumps(payload)}")
                 response = requests.post(url, json=payload, timeout=10)
@@ -136,15 +248,22 @@ class ApiClient:
                         # Extract and store token
                         user_data = data.get("data", {})
                         token = user_data.get("accessToken")
+                        refresh_token = user_data.get("refreshToken")
+                        expires_in = user_data.get("expiresIn", 3600)
                         
                         if token:
                             self.access_token = token
+                            self.refresh_token = refresh_token
+                            self.token_expiry = time.time() + expires_in
                             self.user_data = user_data
                             self.app.user_email = email
                             self.app.is_logged_in = True
                             
                             # Save token securely
-                            self._save_token(token, user_data, email)
+                            self._save_token(token, refresh_token, self.token_expiry, user_data, email)
+                            
+                            # Start token refresh thread
+                            self._start_token_refresh_thread()
                             
                             self.app.log(f"User {email} logged in successfully")
                             
@@ -185,6 +304,7 @@ class ApiClient:
                     
             except requests.RequestException as e:
                 self.app.log(f"Login request error: {str(e)}", "error")
+                self.offline_mode = True
                 
                 if callback:
                     callback(False, "Connection error. Please check your internet connection.")
@@ -203,30 +323,38 @@ class ApiClient:
         headers = {"Authorization": f"Bearer {self.access_token}"}
         
         def _do_logout():
+            # Always stop the token refresh thread
+            self._stop_token_refresh_thread()
+            
             try:
-                response = requests.post(url, headers=headers, timeout=10)
+                # Only attempt server communication if online
+                if not self.offline_mode:
+                    response = requests.post(url, headers=headers, timeout=10)
+                    
+                    if response.status_code == 200:
+                        self.app.log("User logged out successfully on server")
                 
-                # Clear token regardless of response
+                # Clear token regardless of response or online status
                 self.access_token = None
+                self.refresh_token = None
+                self.token_expiry = None
                 self.user_data = None
                 self.app.is_logged_in = False
                 self._clear_token()
                 
-                if response.status_code == 200:
-                    self.app.log("User logged out successfully")
-                    
-                    if callback:
-                        callback(True, "Logout successful")
-                else:
-                    self.app.log(f"Logout failed with status code {response.status_code}", "warning")
-                    
-                    if callback:
-                        callback(True, "Logged out locally")
+                self.app.log("User logged out locally")
+                
+                if callback:
+                    callback(True, "Logout successful")
                         
             except requests.RequestException as e:
                 self.app.log(f"Logout request error: {str(e)}", "error")
+                self.offline_mode = True
+                
                 # Still clear local token
                 self.access_token = None
+                self.refresh_token = None
+                self.token_expiry = None
                 self.user_data = None
                 self.app.is_logged_in = False
                 self._clear_token()
@@ -268,7 +396,16 @@ class ApiClient:
             payload["connection_duration_formatted"] = connection_data.get("connection_duration_formatted", "00:00:00")
         
         def _do_track():
+            # If we're in offline mode, don't even try to connect
+            if self.offline_mode:
+                self.app.log("In offline mode, storing connection data locally", "info")
+                if callback:
+                    callback(False, "In offline mode, connection data stored locally")
+                return
+                
             try:
+                # Define headers for authentication
+                headers = {"Authorization": f"Bearer {self.access_token}"}  # Add this line
                 response = requests.post(url, json=payload, headers=headers, timeout=10)
                 
                 if response.status_code == 200:
@@ -286,6 +423,21 @@ class ApiClient:
                             callback(True, "Connection tracked successfully", data.get("data"))
                         return
                 
+                # If unauthorized, try to refresh token and retry
+                if response.status_code == 401:
+                    self.app.log("Unauthorized while tracking connection, trying to refresh token", "warning")
+                    if self._refresh_token_now():
+                        # Try again with new token
+                        headers = {"Authorization": f"Bearer {self.access_token}"}
+                        response = requests.post(url, json=payload, headers=headers, timeout=10)
+                        
+                        if response.status_code == 200:
+                            data = response.json()
+                            if data.get("success"):
+                                if callback:
+                                    callback(True, "Connection tracked successfully after token refresh", data.get("data"))
+                                return
+                
                 # Handle error
                 self.app.log(f"Connection tracking failed with status code {response.status_code}", "error")
                 
@@ -294,6 +446,7 @@ class ApiClient:
                     
             except requests.RequestException as e:
                 self.app.log(f"Connection tracking request error: {str(e)}", "error")
+                self.offline_mode = True
                 
                 if callback:
                     callback(False, "Connection error. Connection data will be stored locally.")
@@ -305,6 +458,9 @@ class ApiClient:
 def extend_app_authentication(app):
     # Initialize API client
     app.api_client = ApiClient(app)
+    
+    # Add a status indicator for online/offline mode
+    app.is_online = True  # Default to online
     
     # Override login handler
     original_handle_login = app.handle_login
@@ -334,11 +490,19 @@ def extend_app_authentication(app):
     original_handle_logout = app.handle_logout
     
     def handle_logout_extended():
-        app.status_var.set("Logging out...")
+        # Safe access to status_var
+        if hasattr(app, 'status_var'):
+            app.status_var.set("Logging out...")
+        else:
+            print("Logging out...")
         
         def logout_callback(success, message):
             if success:
-                app.status_var.set("Logged out")
+                if hasattr(app, 'status_var'):
+                    app.status_var.set("Logged out")
+                else:
+                    print("Logged out")
+                    
                 # Safely destroy the window
                 if app.root and hasattr(app.root, 'winfo_exists') and app.root.winfo_exists():
                     try:
@@ -354,7 +518,10 @@ def extend_app_authentication(app):
                 
                 threading.Thread(target=show_login_delayed).start()
             else:
-                app.status_var.set(message)
+                if hasattr(app, 'status_var'):
+                    app.status_var.set(message)
+                else:
+                    print(f"Logout error: {message}")
         
         app.api_client.logout(logout_callback)
     
@@ -366,12 +533,88 @@ def extend_app_authentication(app):
         if app.api_client.access_token:
             app.is_logged_in = True
             app.user_email = app.api_client.user_data.get("email") if app.api_client.user_data else None
+            
+            # Start a background check for token validity/refresh
+            def background_token_check():
+                # Wait a moment to ensure app is fully initialized
+                time.sleep(1)
+                # Try to check online status
+                app.api_client.check_online_status()
+                # If token needs refresh, do it
+                if app.api_client.token_expiry and time.time() > app.api_client.token_expiry - 300:
+                    app.api_client._refresh_token_now()
+            
+            threading.Thread(target=background_token_check, daemon=True).start()
+            
             return True
         return False
     
     app.check_login = check_login
     
-    # Modify the app startup to show main window if already logged in
+    # Add a function to update online/offline status display
+    def update_online_status():
+        if hasattr(app, 'online_status_var'):
+            status = "Online" if not app.api_client.offline_mode else "Offline"
+            app.online_status_var.set(f"Status: {status}")
+            
+            # Change color based on status
+            if hasattr(app, 'online_status_label'):
+                color = "green" if not app.api_client.offline_mode else "red"
+                app.online_status_label.config(fg=color)
+    
+    app.update_online_status = update_online_status
+    
+    # Modify the show_main_window method to display online/offline status
+    original_show_main_window = app.show_main_window
+    
+    def show_main_window_extended():
+        # Check if root exists and is valid
+        if hasattr(app, 'root') and app.root:
+            try:
+                # Test if the root window is still valid
+                app.root.winfo_exists()
+                # If valid, destroy existing widgets
+                for widget in app.root.winfo_children():
+                    widget.destroy()
+            except (AttributeError, tk.TclError):
+                # If not valid, set to None so a new one will be created
+                app.root = None
+        
+        # Call original function which will create a new window if needed
+        original_show_main_window()
+        
+        # Add online/offline status indicator if it doesn't exist
+        if hasattr(app, 'root') and app.root and not hasattr(app, 'online_status_var'):
+            status_frame = None
+            
+            # Find the status frame if it exists
+            for widget in app.root.winfo_children():
+                if hasattr(widget, 'winfo_children'):
+                    for child in widget.winfo_children():
+                        if hasattr(child, 'cget') and child.cget('text') == "Connection Status":
+                            status_frame = child
+                            break
+            
+            if status_frame:
+                app.online_status_var = tk.StringVar(value="Status: Checking...")
+                app.online_status_label = tk.Label(status_frame, textvariable=app.online_status_var)
+                app.online_status_label.pack(anchor="w")
+                
+                # Update status
+                app.update_online_status()
+                
+                # Periodically check online status
+                def check_status_periodically():
+                    while app.running and app.is_logged_in:
+                        app.api_client.check_online_status()
+                        app.update_online_status()
+                        time.sleep(30)  # Check every 30 seconds
+                
+                threading.Thread(target=check_status_periodically, daemon=True).start()
+    
+    app.show_main_window = show_main_window_extended
+    
+    # Modify the minimize_to_tray method
     original_minimize_to_tray = app.minimize_to_tray
     
     def minimize_to_tray_extended():

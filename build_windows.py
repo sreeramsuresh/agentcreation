@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""
+Windows build script for Attendance Tracker
+Creates a Windows installer using PyInstaller and NSIS
+"""
+
+import os
+import sys
+import shutil
+import subprocess
+import platform
+import argparse
+from pathlib import Path
+
+# Define app info
+APP_NAME = "AttendanceTracker"
+APP_VERSION = "1.0.0"
+APP_DESCRIPTION = "Attendance Tracker for WiFi-based attendance"
+APP_AUTHOR = "Your Company Name"
+APP_URL = "https://yourcompany.com"
+APP_ICON = "icon.ico"  # Needs to be an .ico file for Windows
+
+def ensure_dependencies(nsis_path=None):
+    """Ensure all build dependencies are installed"""
+    print("Checking build dependencies...")
+    
+    # Check for PyInstaller
+    try:
+        import PyInstaller
+        print("[OK] PyInstaller found")
+    except ImportError:
+        print("[X] PyInstaller not found, installing...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "pyinstaller"])
+    
+    # Check for NSIS
+    nsis_found = False
+    
+    # First, check the provided path
+    if nsis_path and os.path.exists(nsis_path):
+        print(f"[OK] NSIS found at provided path: {nsis_path}")
+        nsis_found = True
+    else:
+        # Try to find makensis in PATH
+        system_nsis_path = shutil.which("makensis")
+        if system_nsis_path:
+            print(f"[OK] NSIS found in PATH at {system_nsis_path}")
+            nsis_found = True
+        else:
+            # Try common installation locations
+            common_paths = [
+                "C:\\Program Files\\NSIS\\makensis.exe",
+                "C:\\Program Files (x86)\\NSIS\\makensis.exe",
+            ]
+            
+            for path in common_paths:
+                if os.path.exists(path):
+                    print(f"[OK] NSIS found at {path}")
+                    nsis_path = path
+                    nsis_found = True
+                    break
+    
+    if not nsis_found:
+        print("[X] NSIS not found. Please install NSIS from https://nsis.sourceforge.io/Download")
+        print("    After installing, make sure it's in your PATH or specify its location with --nsis-path")
+        return False, nsis_path
+    
+    # Check for required Python packages
+    required_packages = ["keyring", "pillow", "pystray", "pywin32"]
+    for package in required_packages:
+        try:
+            __import__(package)
+            print(f"[OK] {package} found")
+        except ImportError:
+            print(f"[X] {package} not found, installing...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+    
+    return True, nsis_path
+
+def create_icon_file():
+    """Create icon.ico file if it doesn't exist"""
+    if os.path.exists(APP_ICON):
+        return
+    
+    print(f"Creating {APP_ICON} file...")
+    try:
+        from PIL import Image
+        # Create a simple colored square
+        img = Image.new('RGB', (256, 256), color=(66, 133, 244))
+        # Save as PNG first
+        png_path = "icon.png"
+        img.save(png_path)
+        
+        # Convert PNG to ICO using Pillow
+        img = Image.open(png_path)
+        icon_sizes = [(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+        img.save(APP_ICON, sizes=icon_sizes)
+        print(f"[OK] Created {APP_ICON}")
+    except Exception as e:
+        print(f"[X] Failed to create icon: {str(e)}")
+        # Create a simple text file with instructions
+        with open("icon_instructions.txt", "w") as f:
+            f.write(f"Please create an icon file named {APP_ICON} before building.")
+
+def create_pyinstaller_spec():
+    """Create PyInstaller spec file"""
+    spec_content = f"""# -*- mode: python ; coding: utf-8 -*-
+
+block_cipher = None
+
+a = Analysis(
+    ['main.py'],
+    pathex=[],
+    binaries=[],
+    datas=[
+        ('icon.png', '.'),
+        ('{APP_ICON}', '.'),
+    ],
+    hiddenimports=['keyring.backends.Windows', 'win32timezone'],
+    hookspath=[],
+    hooksconfig={{}},
+    runtime_hooks=[],
+    excludes=[],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False,
+)
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name='{APP_NAME}',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon='{APP_ICON}',
+    uac_admin=False,
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='{APP_NAME}',
+)
+"""
+    spec_path = f"{APP_NAME}.spec"
+    with open(spec_path, "w") as f:
+        f.write(spec_content)
+    
+    print(f"[OK] Created PyInstaller spec file: {spec_path}")
+    return spec_path
+
+def create_nsis_script():
+    """Create NSIS installer script"""
+    script_content = f"""
+; NSIS script for {APP_NAME} installer
+; Generated by build_windows.py
+
+!include "MUI2.nsh"
+
+; General settings
+Name "{APP_NAME}"
+OutFile "dist\\{APP_NAME}-{APP_VERSION}-Setup.exe"
+Unicode True
+InstallDir "$PROGRAMFILES\\{APP_NAME}"
+InstallDirRegKey HKLM "Software\\{APP_NAME}" "Install_Dir"
+RequestExecutionLevel admin
+
+; Interface settings
+!define MUI_ABORTWARNING
+!define MUI_ICON "{APP_ICON}"
+!define MUI_UNICON "{APP_ICON}"
+!define MUI_WELCOMEPAGE_TITLE "Welcome to the {APP_NAME} Setup Wizard"
+!define MUI_WELCOMEPAGE_TEXT "This will install {APP_NAME} v{APP_VERSION} on your computer.$\\r$\\n$\\r$\\n{APP_DESCRIPTION}$\\r$\\n$\\r$\\nClick Next to continue."
+!define MUI_FINISHPAGE_RUN "$INSTDIR\\{APP_NAME}.exe"
+!define MUI_FINISHPAGE_TITLE "Completing the {APP_NAME} Setup Wizard"
+!define MUI_FINISHPAGE_TEXT "{APP_NAME} has been installed on your computer.$\\r$\\n$\\r$\\nClick Finish to close this wizard."
+
+; Pages
+!insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_LICENSE "LICENSE.txt"
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+
+; Languages
+!insertmacro MUI_LANGUAGE "English"
+
+; Installer sections
+Section "Install"
+    ; Set output path to the installation directory
+    SetOutPath "$INSTDIR"
+    
+    ; Put all files from the PyInstaller dist folder
+    File /r "dist\\{APP_NAME}\\*.*"
+    
+    ; Create uninstaller
+    WriteUninstaller "$INSTDIR\\uninstall.exe"
+    
+    ; Create shortcuts
+    CreateDirectory "$SMPROGRAMS\\{APP_NAME}"
+    CreateShortcut "$SMPROGRAMS\\{APP_NAME}\\{APP_NAME}.lnk" "$INSTDIR\\{APP_NAME}.exe"
+    CreateShortcut "$SMPROGRAMS\\{APP_NAME}\\Uninstall.lnk" "$INSTDIR\\uninstall.exe"
+    CreateShortcut "$DESKTOP\\{APP_NAME}.lnk" "$INSTDIR\\{APP_NAME}.exe"
+    
+    ; Write registry keys for uninstall
+    WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{APP_NAME}" "DisplayName" "{APP_NAME}"
+    WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{APP_NAME}" "UninstallString" '"$INSTDIR\\uninstall.exe"'
+    WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{APP_NAME}" "DisplayIcon" "$INSTDIR\\{APP_ICON}"
+    WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{APP_NAME}" "DisplayVersion" "{APP_VERSION}"
+    WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{APP_NAME}" "Publisher" "{APP_AUTHOR}"
+    WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{APP_NAME}" "URLInfoAbout" "{APP_URL}"
+    WriteRegDWORD HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{APP_NAME}" "NoModify" 1
+    WriteRegDWORD HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{APP_NAME}" "NoRepair" 1
+SectionEnd
+
+; Uninstaller section
+Section "Uninstall"
+    ; Remove installed files and folders
+    Delete "$INSTDIR\\{APP_ICON}"
+    Delete "$INSTDIR\\*.exe"
+    Delete "$INSTDIR\\*.dll"
+    Delete "$INSTDIR\\*.pyd"
+    Delete "$INSTDIR\\*.manifest"
+    Delete "$INSTDIR\\*.ini"
+    Delete "$INSTDIR\\*.zip"
+    Delete "$INSTDIR\\uninstall.exe"
+    
+    ; Remove directories recursively
+    RMDir /r "$INSTDIR\\*.*"
+    RMDir "$INSTDIR"
+    
+    ; Remove shortcuts
+    Delete "$DESKTOP\\{APP_NAME}.lnk"
+    Delete "$SMPROGRAMS\\{APP_NAME}\\*.lnk"
+    RMDir "$SMPROGRAMS\\{APP_NAME}"
+    
+    ; Remove registry keys
+    DeleteRegKey HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{APP_NAME}"
+    DeleteRegKey HKLM "Software\\{APP_NAME}"
+SectionEnd
+"""
+    
+    # Create license file if it doesn't exist
+    if not os.path.exists("LICENSE.txt"):
+        with open("LICENSE.txt", "w") as f:
+            f.write(f"""SOFTWARE LICENSE AGREEMENT FOR {APP_NAME}
+
+PLEASE READ THIS LICENSE AGREEMENT CAREFULLY BEFORE USING THE SOFTWARE.
+
+By installing this software, you agree to be bound by the terms of this agreement.
+
+1. GRANT OF LICENSE
+This application is licensed, not sold. This license gives you the right to install and use the software on your computer.
+
+2. DESCRIPTION OF OTHER RIGHTS AND LIMITATIONS
+The software will collect information about your WiFi connections for attendance tracking purposes.
+You may not reverse engineer, decompile, or disassemble the software.
+
+3. COPYRIGHT
+All title and copyrights in and to the software are owned by {APP_AUTHOR}.
+
+4. PRIVACY POLICY
+The application collects the following information:
+- Your WiFi connection details
+- Computer name and MAC address
+- IP address
+- Connection timestamps
+
+This information is used solely for attendance tracking purposes.
+""")
+    
+    script_path = "installer.nsi"
+    with open(script_path, "w") as f:
+        f.write(script_content)
+    
+    print(f"[OK] Created NSIS installer script: {script_path}")
+    return script_path
+
+def build_exe(spec_path):
+    """Build executable using PyInstaller"""
+    print("Building executable with PyInstaller...")
+    result = subprocess.run(["pyinstaller", "--clean", spec_path], capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        print(f"[X] PyInstaller failed: {result.stderr}")
+        return False
+    else:
+        print("[OK] PyInstaller build successful")
+        return True
+
+def build_installer(nsis_script, nsis_path=None):
+    """Build NSIS installer"""
+    print("Building NSIS installer...")
+    
+    # Use provided NSIS path or search in PATH
+    makensis_cmd = nsis_path if nsis_path else "makensis"
+    
+    print(f"Using NSIS command: {makensis_cmd}")
+    
+    try:
+        result = subprocess.run([makensis_cmd, nsis_script], capture_output=True, text=True)
+        
+        if result.stderr:
+            print(f"NSIS stderr: {result.stderr}")
+        
+        if result.stdout:
+            print(f"NSIS stdout: {result.stdout}")
+        
+        if result.returncode != 0:
+            print(f"[X] NSIS build failed with return code {result.returncode}")
+            return False
+        else:
+            installer_path = os.path.join("dist", f"{APP_NAME}-{APP_VERSION}-Setup.exe")
+            print(f"[OK] Installer created successfully: {installer_path}")
+            return True
+    except Exception as e:
+        print(f"[X] NSIS build failed with exception: {str(e)}")
+        return False
+
+def main():
+    parser = argparse.ArgumentParser(description=f'Build {APP_NAME} for Windows')
+    parser.add_argument('--nsis-path', help='Path to makensis.exe if not in PATH')
+    parser.add_argument('--verbose', action='store_true', help='Show more detailed output')
+    args = parser.parse_args()
+    
+    # Check if running on Windows
+    if platform.system() != "Windows":
+        print("This script must be run on Windows.")
+        sys.exit(1)
+    
+    # Ensure we have all dependencies
+    deps_ok, nsis_path = ensure_dependencies(args.nsis_path)
+    if not deps_ok:
+        sys.exit(1)
+    
+    # Use detected NSIS path if not provided
+    if not args.nsis_path and nsis_path:
+        args.nsis_path = nsis_path
+    
+    # Create icon file if needed
+    create_icon_file()
+    
+    # Create PyInstaller spec
+    spec_path = create_pyinstaller_spec()
+    
+    # Create NSIS script
+    nsis_script = create_nsis_script()
+    
+    # Build executable
+    if not build_exe(spec_path):
+        sys.exit(1)
+    
+    # Build installer
+    if not build_installer(nsis_script, args.nsis_path):
+        sys.exit(1)
+    
+    print(f"\nBuild completed successfully!")
+    print(f"Installer: dist/{APP_NAME}-{APP_VERSION}-Setup.exe")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,24 @@
+SOFTWARE LICENSE AGREEMENT FOR AttendanceTracker
+
+PLEASE READ THIS LICENSE AGREEMENT CAREFULLY BEFORE USING THE SOFTWARE.
+
+By installing this software, you agree to be bound by the terms of this agreement.
+
+1. GRANT OF LICENSE
+This application is licensed, not sold. This license gives you the right to install and use the software on your computer.
+
+2. DESCRIPTION OF OTHER RIGHTS AND LIMITATIONS
+The software will collect information about your WiFi connections for attendance tracking purposes.
+You may not reverse engineer, decompile, or disassemble the software.
+
+3. COPYRIGHT
+All title and copyrights in and to the software are owned by Your Company Name.
+
+4. PRIVACY POLICY
+The application collects the following information:
+- Your WiFi connection details
+- Computer name and MAC address
+- IP address
+- Connection timestamps
+
+This information is used solely for attendance tracking purposes.
