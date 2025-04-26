@@ -116,8 +116,16 @@ class AttendanceApp:
         # Create tray icon
         try:
             image = Image.open(ICON_PATH) if os.path.exists(ICON_PATH) else self.create_default_icon()
+            
+            # Define the callback function for the Open menu item
+            def on_open_clicked(icon, item):
+                if self.is_logged_in:
+                    self.show_main_window()
+                else:
+                    self.show_login()
+            
             menu = (
-                pystray.MenuItem('Open', self.show_login),
+                pystray.MenuItem('Open', on_open_clicked),
                 pystray.MenuItem('Exit', self.exit_app)
             )
             self.tray_icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)

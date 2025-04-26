@@ -12,6 +12,8 @@ from datetime import datetime, timedelta
 import uuid
 import platform
 import subprocess
+import tkinter as tk
+from PIL import Image
 
 class ApiClient:
     def __init__(self, app):
@@ -454,8 +456,12 @@ class ApiClient:
         # Run the tracking request in a separate thread
         threading.Thread(target=_do_track).start()
 
-# Extend AttendanceApp with authentication functions
+# Provide an explicit 'extend_app_authentication' function that must be exported
 def extend_app_authentication(app):
+    """
+    Extend AttendanceApp with authentication functions
+    This is the main exported function for this module
+    """
     # Initialize API client
     app.api_client = ApiClient(app)
     
@@ -503,7 +509,7 @@ def extend_app_authentication(app):
                 else:
                     print("Logged out")
                     
-                # Safely destroy the window
+                # Safely destroy the window if it exists
                 if app.root and hasattr(app.root, 'winfo_exists') and app.root.winfo_exists():
                     try:
                         app.root.destroy()
@@ -511,12 +517,8 @@ def extend_app_authentication(app):
                         pass
                 app.root = None
                 
-                # Short delay before showing login again
-                def show_login_delayed():
-                    time.sleep(0.1)
-                    app.show_login()
-                
-                threading.Thread(target=show_login_delayed).start()
+                # Important: Show the login window immediately
+                app.show_login()
             else:
                 if hasattr(app, 'status_var'):
                     app.status_var.set(message)
@@ -613,6 +615,21 @@ def extend_app_authentication(app):
                 threading.Thread(target=check_status_periodically, daemon=True).start()
     
     app.show_main_window = show_main_window_extended
+    
+    # Add tray icon click handler
+    def on_tray_icon_clicked(icon):
+        if app.is_logged_in:
+            app.show_main_window()
+        else:
+            app.show_login()
+            
+    # If the app already has a tray icon, update its behavior
+    if hasattr(app, 'tray_icon') and app.tray_icon:
+        try:
+            app.tray_icon.on_click = on_tray_icon_clicked
+        except:
+            # Some implementations might not support changing callbacks
+            pass
     
     # Modify the minimize_to_tray method
     original_minimize_to_tray = app.minimize_to_tray
